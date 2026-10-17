@@ -34,7 +34,9 @@ export class ProductsService {
     }
 
     // Store product in Redis
-    await client.set(cacheKey, JSON.stringify(product));
+    await client.set(cacheKey, JSON.stringify(product), {
+      EX: 30,
+    });
 
     return product;
   }
