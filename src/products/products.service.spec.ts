@@ -9,6 +9,7 @@ describe("ProductsService", () => {
   const redisClient = {
     get: vi.fn(),
     set: vi.fn(),
+    del: vi.fn(),
   };
 
   const redisService = {
@@ -69,5 +70,43 @@ describe("ProductsService", () => {
     expect(result).toBeNull();
 
     expect(redisClient.set).not.toHaveBeenCalled();
+  });
+
+  it("updates the product price in the source", async () => {
+    const result = await service.update("1", 1500);
+
+    expect(result).toEqual({
+      id: "1",
+      name: "Keyboard",
+      price: 1500,
+    });
+
+    expect(redisClient.del).toHaveBeenCalledWith("product:1");
+  });
+
+  it("returns the updated price after cache invalidation", async () => {
+    redisClient.get.mockResolvedValue(null);
+
+    await service.update("1", 1500);
+
+    const result = await service.findById("1");
+
+    expect(result).toEqual({
+      id: "1",
+      name: "Keyboard",
+      price: 1500,
+    });
+
+    expect(redisClient.del).toHaveBeenCalledWith("product:1");
+
+    expect(redisClient.set).toHaveBeenCalledWith(
+      "product:1",
+      JSON.stringify({
+        id: "1",
+        name: "Keyboard",
+        price: 1500,
+      }),
+      { EX: 30 },
+    );
   });
 });
