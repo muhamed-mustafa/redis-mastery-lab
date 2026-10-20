@@ -1,5 +1,4 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-
 import { ProductsService } from "./products.service.js";
 import { RedisService } from "../redis/redis.service.js";
 
@@ -10,6 +9,7 @@ describe("ProductsService", () => {
     get: vi.fn(),
     set: vi.fn(),
     del: vi.fn(),
+    eval: vi.fn().mockResolvedValue(1),
   };
 
   const redisService = {
@@ -17,7 +17,9 @@ describe("ProductsService", () => {
   };
 
   beforeEach(() => {
-    vi.clearAllMocks();
+    vi.resetAllMocks();
+
+    redisClient.get.mockResolvedValue(null);
 
     service = new ProductsService(redisService as unknown as RedisService);
   });
@@ -47,7 +49,7 @@ describe("ProductsService", () => {
       price: 1200,
     };
 
-    redisClient.get.mockResolvedValue(null);
+    redisClient.set.mockResolvedValue("OK");
 
     const result = await service.findById("1");
 
@@ -65,11 +67,23 @@ describe("ProductsService", () => {
   it("returns null and does not cache a missing product", async () => {
     redisClient.get.mockResolvedValue(null);
 
+    redisClient.set.mockResolvedValue("OK");
+
     const result = await service.findById("999");
 
     expect(result).toBeNull();
 
-    expect(redisClient.set).not.toHaveBeenCalled();
+    expect(redisClient.set).toHaveBeenCalledWith(
+      "lock:product:999",
+      expect.any(String),
+      { NX: true, PX: 10_000 },
+    );
+
+    expect(redisClient.set).not.toHaveBeenCalledWith(
+      "product:999",
+      expect.any(String),
+      { EX: 30 },
+    );
   });
 
   it("updates the product price in the source", async () => {
@@ -85,7 +99,7 @@ describe("ProductsService", () => {
   });
 
   it("returns the updated price after cache invalidation", async () => {
-    redisClient.get.mockResolvedValue(null);
+    redisClient.set.mockResolvedValue("OK");
 
     await service.update("1", 1500);
 
