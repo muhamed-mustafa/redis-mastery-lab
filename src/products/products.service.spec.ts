@@ -252,4 +252,31 @@ describe("ProductsService", () => {
     expect(results).toEqual(Array(10).fill(product));
     expect(cacheWrites).toBe(1);
   });
+
+  it("throws 503 when the lock remains unavailable until timeout", async () => {
+  vi.useFakeTimers();
+
+  try {
+    redisClient.get.mockResolvedValue(null);
+    redisClient.set.mockResolvedValue(null);
+
+    const resultPromise = service.findById("1");
+
+    const assertion = expect(resultPromise).rejects.toThrow(
+      "Product cache is not ready. Please try again.",
+    );
+
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    await assertion;
+
+    expect(redisClient.set).toHaveBeenCalledWith(
+      "lock:product:1",
+      expect.any(String),
+      { NX: true, PX: 10_000 },
+    );
+  } finally {
+    vi.useRealTimers();
+  }
+});
 });

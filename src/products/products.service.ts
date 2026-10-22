@@ -1,6 +1,6 @@
 import { Injectable, ServiceUnavailableException } from "@nestjs/common";
-import { RedisService } from "../redis/redis.service.js";
 import { randomUUID } from "node:crypto";
+import { RedisService } from "../redis/redis.service.js";
 
 const RELEASE_LOCK_SCRIPT = `
   if redis.call("GET", KEYS[1]) == ARGV[1] then
@@ -13,7 +13,9 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-const MAX_LOCK_ATTEMPTS = 5;
+const MAX_WAIT_MS = 2_000;
+const RETRY_DELAY_MS = 50;
+
 export interface Product {
   id: string;
   name: string;
@@ -44,8 +46,10 @@ export class ProductsService {
 
     console.log("Cache MISS");
 
-    // 2. Retry acquiring the lock
-    for (let attempt = 1; attempt <= MAX_LOCK_ATTEMPTS; attempt++) {
+    const waitStartedAt = Date.now();
+
+    while(Date.now() - waitStartedAt < MAX_WAIT_MS) {
+      // 2. Retry acquiring the lock
       const lockToken = randomUUID();
 
       const lockAcquired = await client.set(lockKey, lockToken, {
@@ -54,10 +58,8 @@ export class ProductsService {
       });
 
       if (!lockAcquired) {
-        console.log(`LOCK NOT ACQUIRED - Attempt ${attempt}`);
 
-        // Give the lock owner time to populate the cache.
-        await sleep(50);
+        await sleep(RETRY_DELAY_MS);
 
         const cachedProductAfterWait = await client.get(cacheKey);
 
@@ -66,11 +68,8 @@ export class ProductsService {
           return JSON.parse(cachedProductAfterWait) as Product;
         }
 
-        // Cache is still empty; try acquiring the lock again.
         continue;
-      }
-
-      console.log(`LOCK ACQUIRED - Attempt ${attempt}`);
+    }
 
       try {
         // 3. Double-check the cache after acquiring the lock
