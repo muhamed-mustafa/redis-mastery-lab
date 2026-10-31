@@ -48,7 +48,9 @@ export class ProductsService {
 
     const waitStartedAt = Date.now();
 
-    while(Date.now() - waitStartedAt < MAX_WAIT_MS) {
+    while (Date.now() - waitStartedAt < MAX_WAIT_MS) {
+      let originalError: Error | null = null;
+
       // 2. Retry acquiring the lock
       const lockToken = randomUUID();
 
@@ -58,7 +60,6 @@ export class ProductsService {
       });
 
       if (!lockAcquired) {
-
         await sleep(RETRY_DELAY_MS);
 
         const cachedProductAfterWait = await client.get(cacheKey);
@@ -69,7 +70,7 @@ export class ProductsService {
         }
 
         continue;
-    }
+      }
 
       try {
         // 3. Double-check the cache after acquiring the lock
@@ -92,12 +93,25 @@ export class ProductsService {
         });
 
         return product;
+      } catch (error) {
+        originalError = error as Error;
+        throw error;
       } finally {
         // 6. Release only our own lock
-        await client.eval(RELEASE_LOCK_SCRIPT, {
-          keys: [lockKey],
-          arguments: [lockToken],
-        });
+        try {
+          await client.eval(RELEASE_LOCK_SCRIPT, {
+            keys: [lockKey],
+            arguments: [lockToken],
+          });
+        } catch (cleanupError) {
+          if (originalError) {
+            console.error("Original error:", originalError);
+            console.error("Cleanup error:", cleanupError);
+          } else {
+            console.error("Failed to release lock:", cleanupError);
+            throw cleanupError;
+          }
+        }
       }
     }
 

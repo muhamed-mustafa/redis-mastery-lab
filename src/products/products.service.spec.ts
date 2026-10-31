@@ -22,9 +22,7 @@ describe("ProductsService", () => {
     redisClient.get.mockResolvedValue(null);
     redisClient.eval.mockResolvedValue(1);
 
-    service = new ProductsService(
-      redisService as unknown as RedisService,
-    );
+    service = new ProductsService(redisService as unknown as RedisService);
   });
 
   it("returns the product from cache on a cache hit", async () => {
@@ -34,9 +32,7 @@ describe("ProductsService", () => {
       price: 1200,
     };
 
-    redisClient.get.mockResolvedValue(
-      JSON.stringify(cachedProduct),
-    );
+    redisClient.get.mockResolvedValue(JSON.stringify(cachedProduct));
 
     const result = await service.findById("1");
 
@@ -254,29 +250,39 @@ describe("ProductsService", () => {
   });
 
   it("throws 503 when the lock remains unavailable until timeout", async () => {
-  vi.useFakeTimers();
+    vi.useFakeTimers();
 
-  try {
-    redisClient.get.mockResolvedValue(null);
-    redisClient.set.mockResolvedValue(null);
+    try {
+      redisClient.get.mockResolvedValue(null);
+      redisClient.set.mockResolvedValue(null);
 
-    const resultPromise = service.findById("1");
+      const resultPromise = service.findById("1");
 
-    const assertion = expect(resultPromise).rejects.toThrow(
-      "Product cache is not ready. Please try again.",
-    );
+      const assertion = expect(resultPromise).rejects.toThrow(
+        "Product cache is not ready. Please try again.",
+      );
 
-    await vi.advanceTimersByTimeAsync(2_000);
+      await vi.advanceTimersByTimeAsync(2_000);
 
-    await assertion;
+      await assertion;
 
-    expect(redisClient.set).toHaveBeenCalledWith(
-      "lock:product:1",
-      expect.any(String),
-      { NX: true, PX: 10_000 },
-    );
-  } finally {
-    vi.useRealTimers();
-  }
-});
+      expect(redisClient.set).toHaveBeenCalledWith(
+        "lock:product:1",
+        expect.any(String),
+        { NX: true, PX: 10_000 },
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("preserves the original cache error when lock release fails", async () => {
+    redisClient.set
+      .mockResolvedValueOnce("OK") // acquire lock
+      .mockRejectedValueOnce(new Error("cache write failed"));
+
+    redisClient.eval.mockRejectedValue(new Error("lock release failed"));
+
+    await expect(service.findById("1")).rejects.toThrow("cache write failed");
+  });
 });
