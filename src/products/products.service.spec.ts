@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { RedisService } from "../redis/redis.service.js";
-import { ProductsService } from "./products.service.js";
+import { Product, ProductsService } from "./products.service.js";
 
 describe("ProductsService", () => {
   let service: ProductsService;
@@ -284,5 +284,76 @@ describe("ProductsService", () => {
     redisClient.eval.mockRejectedValue(new Error("lock release failed"));
 
     await expect(service.findById("1")).rejects.toThrow("cache write failed");
+  });
+
+  it("reproduces stale cache data after an update", async () => {
+    let resolveLoadProduct!: (product: Product | null) => void;
+    let notifyLoadStarted!: () => void;
+
+    const oldProduct: Product = {
+      id: "1",
+      name: "Keyboard",
+      price: 1200,
+    };
+
+    const loadProductPromise = new Promise<Product | null>((resolve) => {
+      resolveLoadProduct = resolve;
+    });
+
+    const loadStarted = new Promise<void>((resolve) => {
+      notifyLoadStarted = resolve;
+    });
+
+    const loadProductSpy = vi.spyOn(service, "loadProduct");
+
+    loadProductSpy
+      .mockImplementationOnce(() => {
+        notifyLoadStarted();
+        return loadProductPromise;
+      })
+      .mockResolvedValueOnce({
+        id: "1",
+        name: "Keyboard",
+        price: 1200,
+      });
+
+    let cachedProduct: string | null = null;
+
+    redisClient.get.mockImplementation(async (key: string) => {
+      return key === "product:1" ? cachedProduct : null;
+    });
+
+    redisClient.set.mockImplementation(
+      async (
+        key: string,
+        value: string,
+        _options?: { NX?: boolean; PX?: number; EX?: number },
+      ) => {
+        if (key === "product:1") {
+          cachedProduct = value;
+        }
+
+        return "OK";
+      },
+    );
+
+    const requestA = service.findById("1");
+
+    await loadStarted;
+
+    await service.update("1", 1500);
+
+    expect(redisClient.del).toHaveBeenCalledWith("product:1");
+    expect(cachedProduct).toBeNull();
+
+    resolveLoadProduct(oldProduct);
+
+    await requestA;
+
+    expect(cachedProduct).toBe(JSON.stringify(oldProduct));
+
+    const result = await service.findById("1");
+
+    expect(result).toEqual(oldProduct);
   });
 });

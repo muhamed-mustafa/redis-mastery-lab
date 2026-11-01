@@ -31,6 +31,10 @@ export class ProductsService {
     { id: "2", name: "Mouse", price: 500 },
   ];
 
+  async loadProduct(id: string): Promise<Product | null> {
+    return this.products.find((product) => product.id === id) ?? null;
+  }
+
   async findById(id: string): Promise<Product | null> {
     const client = this.redisService.getClient();
     const cacheKey = `product:${id}`;
@@ -81,7 +85,7 @@ export class ProductsService {
         }
 
         // 4. Load product from the source
-        const product = this.products.find((product) => product.id === id);
+        const product = await this.loadProduct(id);
 
         if (!product) {
           return null;
@@ -122,7 +126,7 @@ export class ProductsService {
   }
 
   async update(id: string, newPrice: number): Promise<Product | null> {
-    const product = this.products.find((product) => product.id === id);
+    const product = await this.loadProduct(id);
 
     if (!product) {
       return null;
