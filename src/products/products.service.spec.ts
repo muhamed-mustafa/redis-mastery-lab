@@ -20,6 +20,7 @@ describe("ProductsService", () => {
     vi.resetAllMocks();
 
     redisClient.get.mockResolvedValue(null);
+    redisClient.set.mockResolvedValue("OK");
     redisClient.eval.mockResolvedValue(1);
 
     service = new ProductsService(redisService as unknown as RedisService);
@@ -286,7 +287,7 @@ describe("ProductsService", () => {
     await expect(service.findById("1")).rejects.toThrow("cache write failed");
   });
 
-  it("reproduces stale cache data after an update", async () => {
+  it("prevents stale cache data after an update", async () => {
     let resolveLoadProduct!: (product: Product | null) => void;
     let notifyLoadStarted!: () => void;
 
@@ -294,6 +295,12 @@ describe("ProductsService", () => {
       id: "1",
       name: "Keyboard",
       price: 1200,
+    };
+
+    const updatedProduct: Product = {
+      id: "1",
+      name: "Keyboard",
+      price: 1500,
     };
 
     const loadProductPromise = new Promise<Product | null>((resolve) => {
@@ -304,20 +311,19 @@ describe("ProductsService", () => {
       notifyLoadStarted = resolve;
     });
 
+    const originalLoadProduct = service.loadProduct.bind(service);
+
     const loadProductSpy = vi.spyOn(service, "loadProduct");
 
-    loadProductSpy
-      .mockImplementationOnce(() => {
-        notifyLoadStarted();
-        return loadProductPromise;
-      })
-      .mockResolvedValueOnce({
-        id: "1",
-        name: "Keyboard",
-        price: 1200,
-      });
+    loadProductSpy.mockImplementationOnce(() => {
+      notifyLoadStarted();
+      return loadProductPromise;
+    });
+
+    loadProductSpy.mockImplementation(originalLoadProduct);
 
     let cachedProduct: string | null = null;
+    let lockToken: string | null = null;
 
     redisClient.get.mockImplementation(async (key: string) => {
       return key === "product:1" ? cachedProduct : null;
@@ -327,33 +333,77 @@ describe("ProductsService", () => {
       async (
         key: string,
         value: string,
-        _options?: { NX?: boolean; PX?: number; EX?: number },
+        options?: { NX?: boolean; PX?: number; EX?: number },
       ) => {
-        if (key === "product:1") {
-          cachedProduct = value;
+        if (key === "lock:product:1" && options?.NX === true) {
+          if (lockToken !== null) {
+            return null;
+          }
+
+          lockToken = value;
+          return "OK";
         }
 
-        return "OK";
+        if (key === "product:1") {
+          cachedProduct = value;
+          return "OK";
+        }
+
+        return null;
       },
     );
 
+    redisClient.del.mockImplementation(async (key: string) => {
+      if (key === "product:1") {
+        cachedProduct = null;
+      }
+
+      return 1;
+    });
+
+    redisClient.eval.mockImplementation(
+      async (
+        _script: string,
+        options: { keys: string[]; arguments: string[] },
+      ) => {
+        if (lockToken !== options.arguments[0]) {
+          return 0;
+        }
+
+        lockToken = null;
+        return 1;
+      },
+    );
+
+    // A starts reading the old product.
     const requestA = service.findById("1");
 
     await loadStarted;
 
-    await service.update("1", 1500);
+    // B cannot update while A holds the lock.
+    await expect(service.update("1", 1500)).rejects.toThrow(
+      "Product cache is not ready. Please try again.",
+    );
 
-    expect(redisClient.del).toHaveBeenCalledWith("product:1");
     expect(cachedProduct).toBeNull();
 
+    // A finishes reading and caches the old product.
     resolveLoadProduct(oldProduct);
 
     await requestA;
 
     expect(cachedProduct).toBe(JSON.stringify(oldProduct));
 
+    // B retries after A releases the lock.
+    const updateResult = await service.update("1", 1500);
+
+    expect(updateResult).toEqual(updatedProduct);
+    expect(cachedProduct).toBeNull();
+
+    // A new read should return the updated product.
     const result = await service.findById("1");
 
-    expect(result).toEqual(oldProduct);
+    expect(result).toEqual(updatedProduct);
+    expect(cachedProduct).toBe(JSON.stringify(updatedProduct));
   });
 });

@@ -35,6 +35,18 @@ export class ProductsService {
     return this.products.find((product) => product.id === id) ?? null;
   }
 
+  private async acquireLock(lockKey: string): Promise<string | null> {
+    const client = this.redisService.getClient();
+    const lockToken = randomUUID();
+
+    const lockAcquired = await client.set(lockKey, lockToken, {
+      NX: true,
+      PX: 10_000,
+    });
+
+    return lockAcquired ? lockToken : null;
+  }
+
   async findById(id: string): Promise<Product | null> {
     const client = this.redisService.getClient();
     const cacheKey = `product:${id}`;
@@ -55,13 +67,9 @@ export class ProductsService {
     while (Date.now() - waitStartedAt < MAX_WAIT_MS) {
       let originalError: Error | null = null;
 
-      // 2. Retry acquiring the lock
-      const lockToken = randomUUID();
+      const lockToken = await this.acquireLock(lockKey);
 
-      const lockAcquired = await client.set(lockKey, lockToken, {
-        NX: true,
-        PX: 10_000,
-      });
+      const lockAcquired = lockToken !== null;
 
       if (!lockAcquired) {
         await sleep(RETRY_DELAY_MS);
@@ -126,18 +134,33 @@ export class ProductsService {
   }
 
   async update(id: string, newPrice: number): Promise<Product | null> {
-    const product = await this.loadProduct(id);
+    const client = this.redisService.getClient();
+    const cacheKey = `product:${id}`;
+    const lockKey = `lock:${cacheKey}`;
 
-    if (!product) {
-      return null;
+    const lockToken = await this.acquireLock(lockKey);
+
+    if (!lockToken) {
+       throw new ServiceUnavailableException("Product cache is not ready. Please try again.");
     }
 
-    product.price = newPrice;
+    try {
+      const product = await this.loadProduct(id);
 
-    const client = this.redisService.getClient();
+      if (!product) {
+        return null;
+      }
 
-    await client.del(`product:${id}`);
+      product.price = newPrice;
 
-    return product;
+      await client.del(cacheKey);
+
+      return product;
+    } finally {
+      await client.eval(RELEASE_LOCK_SCRIPT, {
+        keys: [lockKey],
+        arguments: [lockToken],
+      });
+    }
   }
 }
