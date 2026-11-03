@@ -9,6 +9,13 @@ const RELEASE_LOCK_SCRIPT = `
   return 0
 `;
 
+const RENEW_LOCK_SCRIPT = `
+  if redis.call("GET", KEYS[1]) == ARGV[1] then
+    return redis.call("PEXPIRE", KEYS[1], ARGV[2])
+  end
+  return 0
+`;
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -33,6 +40,54 @@ export class ProductsService {
 
   async loadProduct(id: string): Promise<Product | null> {
     return this.products.find((product) => product.id === id) ?? null;
+  }
+
+  private async startLockRenewal(lockKey: string, lockToken: string): Promise<{ stop: () => void; lockLost: Promise<never> }> {
+    let stopped = false;
+
+    let rejectLockLost!: (error: Error) => void;
+
+    const lockLost = new Promise<never>((_, reject) => {
+      rejectLockLost = reject;
+    });
+
+    const stop = () => {
+      stopped = true;
+    };
+
+    const renew = async (): Promise<void> => {
+      if (stopped) return;
+
+      const client = this.redisService.getClient();
+
+      try {
+        const result = await client.eval(RENEW_LOCK_SCRIPT, {
+          keys: [lockKey],
+          arguments: [lockToken, "10000"],
+        });
+
+        if (result === 0) {
+          stopped = true;
+          rejectLockLost(new Error("Lock ownership lost"));
+          return;
+        }
+      } catch (error) {
+        stopped = true;
+        rejectLockLost(error as Error);
+        return;
+      }
+
+      await sleep(5_000);
+
+      await renew();
+    };
+
+    void renew();
+
+    return {
+      stop,
+      lockLost,
+    };
   }
 
   private async acquireLock(lockKey: string): Promise<string | null> {
