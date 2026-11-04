@@ -16,6 +16,15 @@ const RENEW_LOCK_SCRIPT = `
   return 0
 `;
 
+const SET_CACHE_IF_LOCK_OWNED_SCRIPT = `
+  if redis.call("GET", KEYS[1]) == ARGV[1] then
+    redis.call("SET", KEYS[2], ARGV[2], "EX", ARGV[3])
+    return 1
+  end
+
+  return 0
+`;
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -42,7 +51,10 @@ export class ProductsService {
     return this.products.find((product) => product.id === id) ?? null;
   }
 
-  private async startLockRenewal(lockKey: string, lockToken: string): Promise<{ stop: () => void; lockLost: Promise<never> }> {
+  private async startLockRenewal(
+    lockKey: string,
+    lockToken: string,
+  ): Promise<{ stop: () => void; lockLost: Promise<never> }> {
     let stopped = false;
 
     let rejectLockLost!: (error: Error) => void;
@@ -51,11 +63,17 @@ export class ProductsService {
       rejectLockLost = reject;
     });
 
+    void lockLost.catch(() => {});
+
     const stop = () => {
       stopped = true;
     };
 
     const renew = async (): Promise<void> => {
+      if (stopped) return;
+
+      await sleep(5_000);
+
       if (stopped) return;
 
       const client = this.redisService.getClient();
@@ -139,6 +157,8 @@ export class ProductsService {
         continue;
       }
 
+      const renewal = await this.startLockRenewal(lockKey, lockToken!);
+
       try {
         // 3. Double-check the cache after acquiring the lock
         const cachedProductAfterLock = await client.get(cacheKey);
@@ -148,16 +168,23 @@ export class ProductsService {
         }
 
         // 4. Load product from the source
-        const product = await this.loadProduct(id);
+        const product = await Promise.race([
+          this.loadProduct(id),
+          renewal.lockLost,
+        ]);
 
         if (!product) {
           return null;
         }
 
-        // 5. Populate the cache
-        await client.set(cacheKey, JSON.stringify(product), {
-          EX: 30,
+        const result = await client.eval(SET_CACHE_IF_LOCK_OWNED_SCRIPT, {
+          keys: [lockKey, cacheKey],
+          arguments: [lockToken, JSON.stringify(product), "30"],
         });
+
+        if (result === 0) {
+          throw new Error("Lock ownership lost");
+        }
 
         return product;
       } catch (error) {
@@ -165,6 +192,8 @@ export class ProductsService {
         throw error;
       } finally {
         // 6. Release only our own lock
+        renewal.stop();
+
         try {
           await client.eval(RELEASE_LOCK_SCRIPT, {
             keys: [lockKey],
@@ -196,7 +225,9 @@ export class ProductsService {
     const lockToken = await this.acquireLock(lockKey);
 
     if (!lockToken) {
-       throw new ServiceUnavailableException("Product cache is not ready. Please try again.");
+      throw new ServiceUnavailableException(
+        "Product cache is not ready. Please try again.",
+      );
     }
 
     try {

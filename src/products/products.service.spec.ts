@@ -49,15 +49,22 @@ describe("ProductsService", () => {
       price: 1200,
     };
 
-    redisClient.set.mockResolvedValue("OK");
+    vi.spyOn(service, "loadProduct").mockResolvedValue(product);
+
+    redisClient.get.mockResolvedValue(null);
+    redisClient.eval.mockResolvedValue(1);
 
     const result = await service.findById("1");
 
     expect(result).toEqual(product);
-    expect(redisClient.set).toHaveBeenCalledWith(
-      "product:1",
-      JSON.stringify(product),
-      { EX: 30 },
+    expect(service.loadProduct).toHaveBeenCalledWith("1");
+
+    expect(redisClient.eval).toHaveBeenCalledWith(
+      expect.stringContaining('redis.call("GET", KEYS[1])'),
+      {
+        keys: ["lock:product:1", "product:1"],
+        arguments: [expect.any(String), JSON.stringify(product), "30"],
+      },
     );
   });
 
