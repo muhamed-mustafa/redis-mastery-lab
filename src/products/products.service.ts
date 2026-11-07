@@ -25,6 +25,14 @@ const SET_CACHE_IF_LOCK_OWNED_SCRIPT = `
   return 0
 `;
 
+const DELETE_CACHE_IF_LOCK_OWNED_SCRIPT = `
+  if redis.call("GET", KEYS[1]) == ARGV[1] then
+    return redis.call("DEL", KEYS[2])
+  end
+
+  return 0
+`;
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -230,6 +238,13 @@ export class ProductsService {
       );
     }
 
+    const renewal = await this.startLockRenewal(lockKey, lockToken);
+
+    const product = await Promise.race([
+      this.loadProduct(id),
+      renewal.lockLost,
+    ]);
+
     try {
       const product = await this.loadProduct(id);
 
@@ -239,10 +254,19 @@ export class ProductsService {
 
       product.price = newPrice;
 
-      await client.del(cacheKey);
+      const result = await client.eval(DELETE_CACHE_IF_LOCK_OWNED_SCRIPT, {
+        keys: [lockKey, cacheKey],
+        arguments: [lockToken],
+      });
+
+      if (result === 0) {
+        throw new Error("Lock ownership lost");
+      }
 
       return product;
     } finally {
+      renewal.stop();
+
       await client.eval(RELEASE_LOCK_SCRIPT, {
         keys: [lockKey],
         arguments: [lockToken],
