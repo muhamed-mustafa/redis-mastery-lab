@@ -240,19 +240,17 @@ export class ProductsService {
 
     const renewal = await this.startLockRenewal(lockKey, lockToken);
 
-    const product = await Promise.race([
-      this.loadProduct(id),
-      renewal.lockLost,
-    ]);
+    let originalError: Error | null = null;
 
     try {
-      const product = await this.loadProduct(id);
+      const product = await Promise.race([
+        this.loadProduct(id),
+        renewal.lockLost,
+      ]);
 
       if (!product) {
         return null;
       }
-
-      product.price = newPrice;
 
       const result = await client.eval(DELETE_CACHE_IF_LOCK_OWNED_SCRIPT, {
         keys: [lockKey, cacheKey],
@@ -263,14 +261,28 @@ export class ProductsService {
         throw new Error("Lock ownership lost");
       }
 
+      product.price = newPrice;
+
       return product;
+    } catch (error) {
+      originalError = error as Error;
+      throw error;
     } finally {
       renewal.stop();
 
-      await client.eval(RELEASE_LOCK_SCRIPT, {
-        keys: [lockKey],
-        arguments: [lockToken],
-      });
+      try {
+        await client.eval(RELEASE_LOCK_SCRIPT, {
+          keys: [lockKey],
+          arguments: [lockToken],
+        });
+      } catch (cleanupError) {
+        if (originalError) {
+          console.error("Original error:", originalError);
+          console.error("Cleanup error:", cleanupError);
+        } else {
+          throw cleanupError;
+        }
+      }
     }
   }
 }
