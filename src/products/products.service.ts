@@ -1,51 +1,16 @@
 import { Injectable, ServiceUnavailableException } from "@nestjs/common";
 import { randomUUID } from "node:crypto";
+import { sleep } from "../common/utils/sleep.js";
+import {
+  DELETE_CACHE_IF_LOCK_OWNED_SCRIPT,
+  RELEASE_LOCK_SCRIPT,
+  RENEW_LOCK_SCRIPT,
+  SET_CACHE_IF_LOCK_OWNED_SCRIPT,
+} from "../redis/redis-lock.scripts.js";
 import { RedisService } from "../redis/redis.service.js";
-
-const RELEASE_LOCK_SCRIPT = `
-  if redis.call("GET", KEYS[1]) == ARGV[1] then
-    return redis.call("DEL", KEYS[1])
-  end
-  return 0
-`;
-
-const RENEW_LOCK_SCRIPT = `
-  if redis.call("GET", KEYS[1]) == ARGV[1] then
-    return redis.call("PEXPIRE", KEYS[1], ARGV[2])
-  end
-  return 0
-`;
-
-const SET_CACHE_IF_LOCK_OWNED_SCRIPT = `
-  if redis.call("GET", KEYS[1]) == ARGV[1] then
-    redis.call("SET", KEYS[2], ARGV[2], "EX", ARGV[3])
-    return 1
-  end
-
-  return 0
-`;
-
-const DELETE_CACHE_IF_LOCK_OWNED_SCRIPT = `
-  if redis.call("GET", KEYS[1]) == ARGV[1] then
-    return redis.call("DEL", KEYS[2])
-  end
-
-  return 0
-`;
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-const MAX_WAIT_MS = 2_000;
-const RETRY_DELAY_MS = 50;
-
-export interface Product {
-  id: string;
-  name: string;
-  price: number;
-}
-
+import type { Product } from "./product.interface.js";
+import { MAX_WAIT_MS, RETRY_DELAY_MS } from "./products.constants.js";
+export type { Product } from "./product.interface.js";
 @Injectable()
 export class ProductsService {
   constructor(private readonly redisService: RedisService) {}
@@ -102,8 +67,6 @@ export class ProductsService {
         rejectLockLost(error as Error);
         return;
       }
-
-      await sleep(5_000);
 
       await renew();
     };
