@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { RedisService } from "../redis/redis.service.js";
-import { ProductsService } from "./products.service.js";
+import { Product, ProductsService } from "./products.service.js";
 
 describe("ProductsService", () => {
   let service: ProductsService;
@@ -20,6 +20,7 @@ describe("ProductsService", () => {
     vi.resetAllMocks();
 
     redisClient.get.mockResolvedValue(null);
+    redisClient.set.mockResolvedValue("OK");
     redisClient.eval.mockResolvedValue(1);
 
     service = new ProductsService(redisService as unknown as RedisService);
@@ -39,6 +40,7 @@ describe("ProductsService", () => {
     expect(result).toEqual(cachedProduct);
     expect(redisClient.get).toHaveBeenCalledWith("product:1");
     expect(redisClient.set).not.toHaveBeenCalled();
+    expect(redisClient.eval).not.toHaveBeenCalled();
   });
 
   it("loads the product from source and caches it on a cache miss", async () => {
@@ -48,21 +50,23 @@ describe("ProductsService", () => {
       price: 1200,
     };
 
-    redisClient.set.mockResolvedValue("OK");
+    vi.spyOn(service, "loadProduct").mockResolvedValue(product);
 
     const result = await service.findById("1");
 
     expect(result).toEqual(product);
-    expect(redisClient.set).toHaveBeenCalledWith(
-      "product:1",
-      JSON.stringify(product),
-      { EX: 30 },
+    expect(service.loadProduct).toHaveBeenCalledWith("1");
+
+    expect(redisClient.eval).toHaveBeenCalledWith(
+      expect.stringContaining('redis.call("SET", KEYS[2]'),
+      {
+        keys: ["lock:product:1", "product:1"],
+        arguments: [expect.any(String), JSON.stringify(product), "30"],
+      },
     );
   });
 
   it("returns null and does not cache a missing product", async () => {
-    redisClient.set.mockResolvedValue("OK");
-
     const result = await service.findById("999");
 
     expect(result).toBeNull();
@@ -73,10 +77,9 @@ describe("ProductsService", () => {
       { NX: true, PX: 10_000 },
     );
 
-    expect(redisClient.set).not.toHaveBeenCalledWith(
-      "product:999",
-      expect.any(String),
-      { EX: 30 },
+    expect(redisClient.eval).not.toHaveBeenCalledWith(
+      expect.stringContaining('redis.call("SET", KEYS[2]'),
+      expect.anything(),
     );
   });
 
@@ -89,36 +92,48 @@ describe("ProductsService", () => {
       price: 1500,
     });
 
-    expect(redisClient.del).toHaveBeenCalledWith("product:1");
+    expect(redisClient.eval).toHaveBeenCalledWith(
+      expect.stringContaining('redis.call("DEL", KEYS[2])'),
+      {
+        keys: ["lock:product:1", "product:1"],
+        arguments: [expect.any(String)],
+      },
+    );
   });
 
   it("returns the updated price after cache invalidation", async () => {
-    redisClient.set.mockResolvedValue("OK");
-
     await service.update("1", 1500);
 
     const result = await service.findById("1");
 
-    expect(result).toEqual({
+    const updatedProduct = {
       id: "1",
       name: "Keyboard",
       price: 1500,
-    });
+    };
 
-    expect(redisClient.del).toHaveBeenCalledWith("product:1");
-    expect(redisClient.set).toHaveBeenCalledWith(
-      "product:1",
-      JSON.stringify({
-        id: "1",
-        name: "Keyboard",
-        price: 1500,
-      }),
-      { EX: 30 },
+    expect(result).toEqual(updatedProduct);
+
+    expect(redisClient.eval).toHaveBeenCalledWith(
+      expect.stringContaining('redis.call("DEL", KEYS[2])'),
+      {
+        keys: ["lock:product:1", "product:1"],
+        arguments: [expect.any(String)],
+      },
+    );
+
+    expect(redisClient.eval).toHaveBeenCalledWith(
+      expect.stringContaining('redis.call("SET", KEYS[2]'),
+      {
+        keys: ["lock:product:1", "product:1"],
+        arguments: [expect.any(String), JSON.stringify(updatedProduct), "30"],
+      },
     );
   });
 
   it("allows only one request to acquire the lock", async () => {
     const lockKey = "lock:product:1";
+
     let lockToken: string | null = null;
     let cachedProduct: string | null = null;
     let lockAttempts = 0;
@@ -149,27 +164,35 @@ describe("ProductsService", () => {
           return "OK";
         }
 
-        if (key === "product:1") {
-          cacheWrites++;
-          cachedProduct = value;
-          return "OK";
-        }
-
         return null;
       },
     );
 
     redisClient.eval.mockImplementation(
       async (
-        _script: string,
+        script: string,
         options: { keys: string[]; arguments: string[] },
       ) => {
-        if (lockToken !== options.arguments[0]) {
-          return 0;
+        if (script.includes('redis.call("SET", KEYS[2]')) {
+          if (lockToken !== options.arguments[0]) {
+            return 0;
+          }
+
+          cacheWrites++;
+          cachedProduct = options.arguments[1];
+          return 1;
         }
 
-        lockToken = null;
-        return 1;
+        if (script.includes('redis.call("DEL", KEYS[1])')) {
+          if (lockToken !== options.arguments[0]) {
+            return 0;
+          }
+
+          lockToken = null;
+          return 1;
+        }
+
+        return 0;
       },
     );
 
@@ -189,6 +212,10 @@ describe("ProductsService", () => {
       name: "Keyboard",
       price: 1200,
     };
+
+    const loadProductSpy = vi
+      .spyOn(service, "loadProduct")
+      .mockResolvedValue(product);
 
     let lockToken: string | null = null;
     let cachedProduct: string | null = null;
@@ -217,27 +244,35 @@ describe("ProductsService", () => {
           return "OK";
         }
 
-        if (key === "product:1") {
-          cacheWrites++;
-          cachedProduct = value;
-          return "OK";
-        }
-
         return null;
       },
     );
 
     redisClient.eval.mockImplementation(
       async (
-        _script: string,
+        script: string,
         options: { keys: string[]; arguments: string[] },
       ) => {
-        if (lockToken !== options.arguments[0]) {
-          return 0;
+        if (script.includes('redis.call("SET", KEYS[2]')) {
+          if (lockToken !== options.arguments[0]) {
+            return 0;
+          }
+
+          cacheWrites++;
+          cachedProduct = options.arguments[1];
+          return 1;
         }
 
-        lockToken = null;
-        return 1;
+        if (script.includes('redis.call("DEL", KEYS[1])')) {
+          if (lockToken !== options.arguments[0]) {
+            return 0;
+          }
+
+          lockToken = null;
+          return 1;
+        }
+
+        return 0;
       },
     );
 
@@ -246,6 +281,7 @@ describe("ProductsService", () => {
     );
 
     expect(results).toEqual(Array(10).fill(product));
+    expect(loadProductSpy).toHaveBeenCalledTimes(1);
     expect(cacheWrites).toBe(1);
   });
 
@@ -277,12 +313,147 @@ describe("ProductsService", () => {
   });
 
   it("preserves the original cache error when lock release fails", async () => {
-    redisClient.set
-      .mockResolvedValueOnce("OK") // acquire lock
-      .mockRejectedValueOnce(new Error("cache write failed"));
+    redisClient.eval.mockImplementation(async (script: string) => {
+      if (script.includes('redis.call("SET", KEYS[2]')) {
+        throw new Error("cache write failed");
+      }
 
-    redisClient.eval.mockRejectedValue(new Error("lock release failed"));
+      if (script.includes('redis.call("DEL", KEYS[1])')) {
+        throw new Error("lock release failed");
+      }
+
+      return 1;
+    });
 
     await expect(service.findById("1")).rejects.toThrow("cache write failed");
+  });
+
+  it("prevents stale cache data after an update", async () => {
+    let resolveLoadProduct!: (product: Product | null) => void;
+    let notifyLoadStarted!: () => void;
+
+    const oldProduct: Product = {
+      id: "1",
+      name: "Keyboard",
+      price: 1200,
+    };
+
+    const updatedProduct: Product = {
+      id: "1",
+      name: "Keyboard",
+      price: 1500,
+    };
+
+    const loadProductPromise = new Promise<Product | null>((resolve) => {
+      resolveLoadProduct = resolve;
+    });
+
+    const loadStarted = new Promise<void>((resolve) => {
+      notifyLoadStarted = resolve;
+    });
+
+    const originalLoadProduct = service.loadProduct.bind(service);
+
+    const loadProductSpy = vi.spyOn(service, "loadProduct");
+
+    loadProductSpy.mockImplementationOnce(() => {
+      notifyLoadStarted();
+      return loadProductPromise;
+    });
+
+    loadProductSpy.mockImplementation(originalLoadProduct);
+
+    let cachedProduct: string | null = null;
+    let lockToken: string | null = null;
+
+    redisClient.get.mockImplementation(async (key: string) => {
+      return key === "product:1" ? cachedProduct : null;
+    });
+
+    redisClient.set.mockImplementation(
+      async (
+        key: string,
+        value: string,
+        options?: { NX?: boolean; PX?: number; EX?: number },
+      ) => {
+        if (key === "lock:product:1" && options?.NX === true) {
+          if (lockToken !== null) {
+            return null;
+          }
+
+          lockToken = value;
+          return "OK";
+        }
+
+        return null;
+      },
+    );
+
+    redisClient.eval.mockImplementation(
+      async (
+        script: string,
+        options: { keys: string[]; arguments: string[] },
+      ) => {
+        if (script.includes('redis.call("SET", KEYS[2]')) {
+          if (lockToken !== options.arguments[0]) {
+            return 0;
+          }
+
+          cachedProduct = options.arguments[1];
+          return 1;
+        }
+
+        if (script.includes('redis.call("DEL", KEYS[2])')) {
+          if (lockToken !== options.arguments[0]) {
+            return 0;
+          }
+
+          cachedProduct = null;
+          return 1;
+        }
+
+        if (script.includes('redis.call("DEL", KEYS[1])')) {
+          if (lockToken !== options.arguments[0]) {
+            return 0;
+          }
+
+          lockToken = null;
+          return 1;
+        }
+
+        return 0;
+      },
+    );
+
+    // A starts reading the old product.
+    const requestA = service.findById("1");
+
+    await loadStarted;
+
+    // B cannot update while A holds the lock.
+    await expect(service.update("1", 1500)).rejects.toThrow(
+      "Product cache is not ready. Please try again.",
+    );
+
+    expect(cachedProduct).toBeNull();
+
+    // A finishes reading and caches the old product.
+    resolveLoadProduct(oldProduct);
+
+    await requestA;
+
+    expect(cachedProduct).toBe(JSON.stringify(oldProduct));
+
+    // B retries after A releases the lock.
+    const updateResult = await service.update("1", 1500);
+
+    expect(updateResult).toEqual(updatedProduct);
+    expect(cachedProduct).toBeNull();
+
+    // A new read should return the updated product.
+    const result = await service.findById("1");
+
+    expect(result).toEqual(updatedProduct);
+    expect(cachedProduct).toBe(JSON.stringify(updatedProduct));
   });
 });

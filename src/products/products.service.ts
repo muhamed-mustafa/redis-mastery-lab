@@ -1,27 +1,16 @@
 import { Injectable, ServiceUnavailableException } from "@nestjs/common";
 import { randomUUID } from "node:crypto";
+import { sleep } from "../common/utils/sleep.js";
+import {
+  DELETE_CACHE_IF_LOCK_OWNED_SCRIPT,
+  RELEASE_LOCK_SCRIPT,
+  RENEW_LOCK_SCRIPT,
+  SET_CACHE_IF_LOCK_OWNED_SCRIPT,
+} from "../redis/redis-lock.scripts.js";
 import { RedisService } from "../redis/redis.service.js";
-
-const RELEASE_LOCK_SCRIPT = `
-  if redis.call("GET", KEYS[1]) == ARGV[1] then
-    return redis.call("DEL", KEYS[1])
-  end
-  return 0
-`;
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-const MAX_WAIT_MS = 2_000;
-const RETRY_DELAY_MS = 50;
-
-export interface Product {
-  id: string;
-  name: string;
-  price: number;
-}
-
+import type { Product } from "./product.interface.js";
+import { MAX_WAIT_MS, RETRY_DELAY_MS } from "./products.constants.js";
+export type { Product } from "./product.interface.js";
 @Injectable()
 export class ProductsService {
   constructor(private readonly redisService: RedisService) {}
@@ -30,6 +19,77 @@ export class ProductsService {
     { id: "1", name: "Keyboard", price: 1200 },
     { id: "2", name: "Mouse", price: 500 },
   ];
+
+  async loadProduct(id: string): Promise<Product | null> {
+    return this.products.find((product) => product.id === id) ?? null;
+  }
+
+  private async startLockRenewal(
+    lockKey: string,
+    lockToken: string,
+  ): Promise<{ stop: () => void; lockLost: Promise<never> }> {
+    let stopped = false;
+
+    let rejectLockLost!: (error: Error) => void;
+
+    const lockLost = new Promise<never>((_, reject) => {
+      rejectLockLost = reject;
+    });
+
+    void lockLost.catch(() => {});
+
+    const stop = () => {
+      stopped = true;
+    };
+
+    const renew = async (): Promise<void> => {
+      if (stopped) return;
+
+      await sleep(5_000);
+
+      if (stopped) return;
+
+      const client = this.redisService.getClient();
+
+      try {
+        const result = await client.eval(RENEW_LOCK_SCRIPT, {
+          keys: [lockKey],
+          arguments: [lockToken, "10000"],
+        });
+
+        if (result === 0) {
+          stopped = true;
+          rejectLockLost(new Error("Lock ownership lost"));
+          return;
+        }
+      } catch (error) {
+        stopped = true;
+        rejectLockLost(error as Error);
+        return;
+      }
+
+      await renew();
+    };
+
+    void renew();
+
+    return {
+      stop,
+      lockLost,
+    };
+  }
+
+  private async acquireLock(lockKey: string): Promise<string | null> {
+    const client = this.redisService.getClient();
+    const lockToken = randomUUID();
+
+    const lockAcquired = await client.set(lockKey, lockToken, {
+      NX: true,
+      PX: 10_000,
+    });
+
+    return lockAcquired ? lockToken : null;
+  }
 
   async findById(id: string): Promise<Product | null> {
     const client = this.redisService.getClient();
@@ -51,13 +111,9 @@ export class ProductsService {
     while (Date.now() - waitStartedAt < MAX_WAIT_MS) {
       let originalError: Error | null = null;
 
-      // 2. Retry acquiring the lock
-      const lockToken = randomUUID();
+      const lockToken = await this.acquireLock(lockKey);
 
-      const lockAcquired = await client.set(lockKey, lockToken, {
-        NX: true,
-        PX: 10_000,
-      });
+      const lockAcquired = lockToken !== null;
 
       if (!lockAcquired) {
         await sleep(RETRY_DELAY_MS);
@@ -72,6 +128,8 @@ export class ProductsService {
         continue;
       }
 
+      const renewal = await this.startLockRenewal(lockKey, lockToken!);
+
       try {
         // 3. Double-check the cache after acquiring the lock
         const cachedProductAfterLock = await client.get(cacheKey);
@@ -81,16 +139,23 @@ export class ProductsService {
         }
 
         // 4. Load product from the source
-        const product = this.products.find((product) => product.id === id);
+        const product = await Promise.race([
+          this.loadProduct(id),
+          renewal.lockLost,
+        ]);
 
         if (!product) {
           return null;
         }
 
-        // 5. Populate the cache
-        await client.set(cacheKey, JSON.stringify(product), {
-          EX: 30,
+        const result = await client.eval(SET_CACHE_IF_LOCK_OWNED_SCRIPT, {
+          keys: [lockKey, cacheKey],
+          arguments: [lockToken, JSON.stringify(product), "30"],
         });
+
+        if (result === 0) {
+          throw new Error("Lock ownership lost");
+        }
 
         return product;
       } catch (error) {
@@ -98,6 +163,8 @@ export class ProductsService {
         throw error;
       } finally {
         // 6. Release only our own lock
+        renewal.stop();
+
         try {
           await client.eval(RELEASE_LOCK_SCRIPT, {
             keys: [lockKey],
@@ -122,18 +189,63 @@ export class ProductsService {
   }
 
   async update(id: string, newPrice: number): Promise<Product | null> {
-    const product = this.products.find((product) => product.id === id);
+    const client = this.redisService.getClient();
+    const cacheKey = `product:${id}`;
+    const lockKey = `lock:${cacheKey}`;
 
-    if (!product) {
-      return null;
+    const lockToken = await this.acquireLock(lockKey);
+
+    if (!lockToken) {
+      throw new ServiceUnavailableException(
+        "Product cache is not ready. Please try again.",
+      );
     }
 
-    product.price = newPrice;
+    const renewal = await this.startLockRenewal(lockKey, lockToken);
 
-    const client = this.redisService.getClient();
+    let originalError: Error | null = null;
 
-    await client.del(`product:${id}`);
+    try {
+      const product = await Promise.race([
+        this.loadProduct(id),
+        renewal.lockLost,
+      ]);
 
-    return product;
+      if (!product) {
+        return null;
+      }
+
+      const result = await client.eval(DELETE_CACHE_IF_LOCK_OWNED_SCRIPT, {
+        keys: [lockKey, cacheKey],
+        arguments: [lockToken],
+      });
+
+      if (result === 0) {
+        throw new Error("Lock ownership lost");
+      }
+
+      product.price = newPrice;
+
+      return product;
+    } catch (error) {
+      originalError = error as Error;
+      throw error;
+    } finally {
+      renewal.stop();
+
+      try {
+        await client.eval(RELEASE_LOCK_SCRIPT, {
+          keys: [lockKey],
+          arguments: [lockToken],
+        });
+      } catch (cleanupError) {
+        if (originalError) {
+          console.error("Original error:", originalError);
+          console.error("Cleanup error:", cleanupError);
+        } else {
+          throw cleanupError;
+        }
+      }
+    }
   }
 }
