@@ -41,4 +41,34 @@ export class RateLimitingController {
 
     return { message: "Request successful" };
   }
+
+  @Get("sliding-window-log")
+  async slidingWindowLog(@Req() req: Request): Promise<{ message: string }> {
+    const userId = req.headers["x-user-id"];
+
+    if (typeof userId !== "string" || !userId.trim()) {
+      throw new BadRequestException("User ID not found");
+    }
+
+    const normalizedUserId = userId.trim();
+    const now = Date.now();
+    const windowMs = 60_000;
+    const limit = 5;
+
+    const allowed = await this.rateLimitingService.checkSlidingWindowLog(
+      normalizedUserId,
+      now,
+      windowMs,
+      limit,
+    );
+
+    if (!allowed) {
+      throw new HttpException(
+        "Rate limit exceeded",
+        HttpStatus.TOO_MANY_REQUESTS,
+      );
+    }
+
+    return { message: "Request successful" };
+  }
 }
