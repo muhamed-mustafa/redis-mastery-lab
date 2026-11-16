@@ -21,6 +21,11 @@ export class RateLimitingService {
     "utf8",
   );
 
+  private readonly slidingWindowCounterScript = readFileSync(
+    join(currentDir, "scripts", "sliding-window-counter.lua"),
+    "utf8",
+  );
+
   async checkSlidingWindowLog(
     userId: string,
     now: number,
@@ -42,6 +47,31 @@ export class RateLimitingService {
         requestId,
         String(windowMs),
       ],
+    });
+
+    return Number(result) === 1;
+  }
+
+  async checkSlidingWindowCounter(
+    userId: string,
+    now: number,
+    windowMs: number,
+    limit: number,
+  ): Promise<boolean> {
+    const windowId = Math.floor(now / windowMs);
+    const previousKey = `rate-limit:user:${userId}:${windowId - 1}`;
+    const currentKey = `rate-limit:user:${userId}:${windowId}`;
+
+    const elapsed = now % windowMs;
+    const previousWindowWeight = 1 - elapsed / windowMs;
+
+    const ttl = windowMs * 2;
+
+    const client = this.redisService.getClient();
+
+    const result = await client.eval(this.slidingWindowCounterScript, {
+      keys: [previousKey, currentKey],
+      arguments: [String(previousWindowWeight), String(limit), String(ttl)],
     });
 
     return Number(result) === 1;
