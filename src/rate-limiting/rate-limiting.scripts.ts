@@ -1,9 +1,25 @@
-export const FIXED_WINDOW_SCRIPT = `
-  local count = redis.call("INCR", KEYS[1])
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
-  if count == 1 then
-    redis.call("PEXPIRE", KEYS[1], ARGV[1])
-  end
+const scriptsDir = join(
+  fileURLToPath(new URL(".", import.meta.url)),
+  "scripts",
+);
 
-  return count
-`;
+export const FIXED_WINDOW_SCRIPT = readFileSync(
+  join(scriptsDir, "fixed-window.lua"),
+  "utf8",
+);
+export const SLIDING_WINDOW_LOG_SCRIPT = readFileSync(
+  join(scriptsDir, "sliding-window-log.lua"),
+  "utf8",
+);
+export const SLIDING_WINDOW_COUNTER_SCRIPT = readFileSync(
+  join(scriptsDir, "sliding-window-counter.lua"),
+  "utf8",
+);
+export const IP_USER_RATE_LIMIT_SCRIPT = readFileSync(
+  join(scriptsDir, "ip-user-rate-limit.lua"),
+  "utf8",
+);
