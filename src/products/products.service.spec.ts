@@ -1,4 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { RedisLockService } from "../redis/redis-lock.service.js";
+import { RENEW_LOCK_SCRIPT } from "../redis/redis-lock.scripts.js";
 import { RedisService } from "../redis/redis.service.js";
 import { Product, ProductsService } from "./products.service.js";
 
@@ -23,7 +25,10 @@ describe("ProductsService", () => {
     redisClient.set.mockResolvedValue("OK");
     redisClient.eval.mockResolvedValue(1);
 
-    service = new ProductsService(redisService as unknown as RedisService);
+    service = new ProductsService(
+      redisService as unknown as RedisService,
+      new RedisLockService(redisService as unknown as RedisService),
+    );
   });
 
   it("returns the product from cache on a cache hit", async () => {
@@ -84,6 +89,19 @@ describe("ProductsService", () => {
   });
 
   it("updates the product price in the source", async () => {
+    const cache = {
+      value: JSON.stringify({ id: "1", name: "Keyboard", price: 1200 }) as
+        string | null,
+    };
+
+    redisClient.eval.mockImplementation(async (script: string) => {
+      if (script.includes('redis.call("DEL", KEYS[2])')) {
+        cache.value = null;
+      }
+
+      return 1;
+    });
+
     const result = await service.update("1", 1500);
 
     expect(result).toEqual({
@@ -99,6 +117,65 @@ describe("ProductsService", () => {
         arguments: [expect.any(String)],
       },
     );
+    expect(cache.value).toBeNull();
+  });
+
+  it("updates when the cache key is absent but the lock is owned", async () => {
+    const cache = { value: null as string | null };
+
+    redisClient.eval.mockImplementation(async (script: string) => {
+      if (script.includes('redis.call("DEL", KEYS[2])')) {
+        cache.value = null;
+      }
+
+      return 1;
+    });
+
+    const result = await service.update("1", 1500);
+
+    expect(result).toEqual({
+      id: "1",
+      name: "Keyboard",
+      price: 1500,
+    });
+    expect(redisClient.eval).toHaveBeenCalledWith(
+      expect.stringContaining('redis.call("DEL", KEYS[2])'),
+      {
+        keys: ["lock:product:1", "product:1"],
+        arguments: [expect.any(String)],
+      },
+    );
+    expect(cache.value).toBeNull();
+  });
+
+  it("preserves the cache and reports lost ownership when deletion is rejected", async () => {
+    const cachedValue = JSON.stringify({
+      id: "1",
+      name: "Keyboard",
+      price: 1200,
+    });
+    const cache = { value: cachedValue as string | null };
+    const heldToken = "another-owner-token";
+
+    redisClient.eval.mockImplementation(
+      async (script: string, options: { arguments: string[] }) => {
+        if (script.includes('redis.call("DEL", KEYS[2])')) {
+          if (options.arguments[0] !== heldToken) {
+            return 0;
+          }
+
+          cache.value = null;
+          return 1;
+        }
+
+        return 1;
+      },
+    );
+
+    await expect(service.update("1", 1500)).rejects.toThrow(
+      "Lock ownership lost",
+    );
+    expect(cache.value).toBe(cachedValue);
   });
 
   it("returns the updated price after cache invalidation", async () => {
@@ -326,6 +403,49 @@ describe("ProductsService", () => {
     });
 
     await expect(service.findById("1")).rejects.toThrow("cache write failed");
+  });
+
+  it("does not write cache after a Redis renewal error", async () => {
+    vi.useFakeTimers();
+    let notifyLoadStarted!: () => void;
+    let resolveLoad!: (product: Product | null) => void;
+
+    const loadStarted = new Promise<void>((resolve) => {
+      notifyLoadStarted = resolve;
+    });
+    const loadProduct = new Promise<Product | null>((resolve) => {
+      resolveLoad = resolve;
+    });
+
+    vi.spyOn(service, "loadProduct").mockImplementation(() => {
+      notifyLoadStarted();
+      return loadProduct;
+    });
+
+    redisClient.eval.mockImplementation(async (script: string) => {
+      if (script === RENEW_LOCK_SCRIPT) {
+        throw new Error("Redis unavailable");
+      }
+
+      return 1;
+    });
+
+    try {
+      const request = service.findById("1");
+      const assertion = expect(request).rejects.toThrow("Redis unavailable");
+
+      await loadStarted;
+      await vi.advanceTimersByTimeAsync(5_000);
+      await assertion;
+      resolveLoad({ id: "1", name: "Keyboard", price: 1200 });
+
+      expect(redisClient.eval).not.toHaveBeenCalledWith(
+        expect.stringContaining('redis.call("SET", KEYS[2]'),
+        expect.anything(),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("prevents stale cache data after an update", async () => {

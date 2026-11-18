@@ -1,19 +1,20 @@
 import { Injectable, ServiceUnavailableException } from "@nestjs/common";
-import { randomUUID } from "node:crypto";
 import { sleep } from "../common/utils/sleep.js";
+import { RedisLockService } from "../redis/redis-lock.service.js";
+import { RedisService } from "../redis/redis.service.js";
 import {
   DELETE_CACHE_IF_LOCK_OWNED_SCRIPT,
-  RELEASE_LOCK_SCRIPT,
-  RENEW_LOCK_SCRIPT,
   SET_CACHE_IF_LOCK_OWNED_SCRIPT,
-} from "../redis/redis-lock.scripts.js";
-import { RedisService } from "../redis/redis.service.js";
+} from "./products-cache.scripts.js";
 import type { Product } from "./product.interface.js";
 import { MAX_WAIT_MS, RETRY_DELAY_MS } from "./products.constants.js";
 export type { Product } from "./product.interface.js";
 @Injectable()
 export class ProductsService {
-  constructor(private readonly redisService: RedisService) {}
+  constructor(
+    private readonly redisService: RedisService,
+    private readonly redisLockService: RedisLockService,
+  ) {}
 
   private products: Product[] = [
     { id: "1", name: "Keyboard", price: 1200 },
@@ -22,73 +23,6 @@ export class ProductsService {
 
   async loadProduct(id: string): Promise<Product | null> {
     return this.products.find((product) => product.id === id) ?? null;
-  }
-
-  private async startLockRenewal(
-    lockKey: string,
-    lockToken: string,
-  ): Promise<{ stop: () => void; lockLost: Promise<never> }> {
-    let stopped = false;
-
-    let rejectLockLost!: (error: Error) => void;
-
-    const lockLost = new Promise<never>((_, reject) => {
-      rejectLockLost = reject;
-    });
-
-    void lockLost.catch(() => {});
-
-    const stop = () => {
-      stopped = true;
-    };
-
-    const renew = async (): Promise<void> => {
-      if (stopped) return;
-
-      await sleep(5_000);
-
-      if (stopped) return;
-
-      const client = this.redisService.getClient();
-
-      try {
-        const result = await client.eval(RENEW_LOCK_SCRIPT, {
-          keys: [lockKey],
-          arguments: [lockToken, "10000"],
-        });
-
-        if (result === 0) {
-          stopped = true;
-          rejectLockLost(new Error("Lock ownership lost"));
-          return;
-        }
-      } catch (error) {
-        stopped = true;
-        rejectLockLost(error as Error);
-        return;
-      }
-
-      await renew();
-    };
-
-    void renew();
-
-    return {
-      stop,
-      lockLost,
-    };
-  }
-
-  private async acquireLock(lockKey: string): Promise<string | null> {
-    const client = this.redisService.getClient();
-    const lockToken = randomUUID();
-
-    const lockAcquired = await client.set(lockKey, lockToken, {
-      NX: true,
-      PX: 10_000,
-    });
-
-    return lockAcquired ? lockToken : null;
   }
 
   async findById(id: string): Promise<Product | null> {
@@ -111,11 +45,9 @@ export class ProductsService {
     while (Date.now() - waitStartedAt < MAX_WAIT_MS) {
       let originalError: Error | null = null;
 
-      const lockToken = await this.acquireLock(lockKey);
+      const lockToken = await this.redisLockService.acquire(lockKey);
 
-      const lockAcquired = lockToken !== null;
-
-      if (!lockAcquired) {
+      if (!lockToken) {
         await sleep(RETRY_DELAY_MS);
 
         const cachedProductAfterWait = await client.get(cacheKey);
@@ -128,7 +60,10 @@ export class ProductsService {
         continue;
       }
 
-      const renewal = await this.startLockRenewal(lockKey, lockToken!);
+      const renewal = await this.redisLockService.startRenewal(
+        lockKey,
+        lockToken,
+      );
 
       try {
         // 3. Double-check the cache after acquiring the lock
@@ -148,10 +83,13 @@ export class ProductsService {
           return null;
         }
 
-        const result = await client.eval(SET_CACHE_IF_LOCK_OWNED_SCRIPT, {
+        renewal.assertNotLost();
+
+        const cacheWrite = client.eval(SET_CACHE_IF_LOCK_OWNED_SCRIPT, {
           keys: [lockKey, cacheKey],
           arguments: [lockToken, JSON.stringify(product), "30"],
         });
+        const result = await Promise.race([cacheWrite, renewal.lockLost]);
 
         if (result === 0) {
           throw new Error("Lock ownership lost");
@@ -166,10 +104,7 @@ export class ProductsService {
         renewal.stop();
 
         try {
-          await client.eval(RELEASE_LOCK_SCRIPT, {
-            keys: [lockKey],
-            arguments: [lockToken],
-          });
+          await this.redisLockService.release(lockKey, lockToken);
         } catch (cleanupError) {
           if (originalError) {
             console.error("Original error:", originalError);
@@ -193,7 +128,7 @@ export class ProductsService {
     const cacheKey = `product:${id}`;
     const lockKey = `lock:${cacheKey}`;
 
-    const lockToken = await this.acquireLock(lockKey);
+    const lockToken = await this.redisLockService.acquire(lockKey);
 
     if (!lockToken) {
       throw new ServiceUnavailableException(
@@ -201,7 +136,10 @@ export class ProductsService {
       );
     }
 
-    const renewal = await this.startLockRenewal(lockKey, lockToken);
+    const renewal = await this.redisLockService.startRenewal(
+      lockKey,
+      lockToken,
+    );
 
     let originalError: Error | null = null;
 
@@ -215,10 +153,13 @@ export class ProductsService {
         return null;
       }
 
-      const result = await client.eval(DELETE_CACHE_IF_LOCK_OWNED_SCRIPT, {
+      renewal.assertNotLost();
+
+      const cacheDelete = client.eval(DELETE_CACHE_IF_LOCK_OWNED_SCRIPT, {
         keys: [lockKey, cacheKey],
         arguments: [lockToken],
       });
+      const result = await Promise.race([cacheDelete, renewal.lockLost]);
 
       if (result === 0) {
         throw new Error("Lock ownership lost");
@@ -234,10 +175,7 @@ export class ProductsService {
       renewal.stop();
 
       try {
-        await client.eval(RELEASE_LOCK_SCRIPT, {
-          keys: [lockKey],
-          arguments: [lockToken],
-        });
+        await this.redisLockService.release(lockKey, lockToken);
       } catch (cleanupError) {
         if (originalError) {
           console.error("Original error:", originalError);
